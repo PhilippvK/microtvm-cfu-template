@@ -34,16 +34,18 @@ import termios
 import tty
 import distutils.util
 
+
 def configure_pty_raw(fd):
     attrs = termios.tcgetattr(fd)
-    attrs[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG | termios.IEXTEN) # lflag
+    attrs[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG | termios.IEXTEN)  # lflag
     attrs[1] &= ~termios.OPOST  # oflag
-    attrs[0] &= ~(termios.IXON | termios.IXOFF | termios.ICRNL | termios.INLCR) # iflag
+    attrs[0] &= ~(termios.IXON | termios.IXOFF | termios.ICRNL | termios.INLCR)  # iflag
     attrs[2] |= termios.CS8  # cflag
     attrs[6][termios.VMIN] = 1
     attrs[6][termios.VTIME] = 0
     tty.setraw(fd)
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
 
 import warnings
 
@@ -54,8 +56,8 @@ from tvm.micro.project_api import server
 _LOG = logging.getLogger(__name__)
 _LOG.setLevel(logging.WARNING)
 
-# PRINT = False
-PRINT = True
+PRINT = False
+# PRINT = True
 
 PROJECT_DIR = pathlib.Path(os.path.dirname(__file__) or os.getcwd())
 
@@ -102,9 +104,7 @@ class Handler(server.ProjectAPIHandler):
         return server.ServerInfo(
             platform_name="host",
             is_template=IS_TEMPLATE,
-            model_library_format_path=""
-            if IS_TEMPLATE
-            else PROJECT_DIR / MODEL_LIBRARY_FORMAT_RELPATH,
+            model_library_format_path="" if IS_TEMPLATE else PROJECT_DIR / MODEL_LIBRARY_FORMAT_RELPATH,
             project_options=[
                 server.ProjectOption(
                     "verbose",
@@ -225,9 +225,6 @@ class Handler(server.ProjectAPIHandler):
             options.get("workspace_size_bytes", WORKSPACE_SIZE_BYTES),
             options.get("debug", False),
         )
-        support_path = project_dir / "support"
-        os.mkdir(support_path)
-        shutil.copytree(current_dir / "support", support_path, dirs_exist_ok=True)
         # Copy project files
         shutil.copy2(
             current_dir / "cfu.v",
@@ -270,6 +267,8 @@ class Handler(server.ProjectAPIHandler):
             else:
                 shutil.copy2(src_path, dst_path)
 
+        support_path = src_dir / "support"
+        shutil.copytree(current_dir / "support", support_path, dirs_exist_ok=True)
 
         # Copy codegen files to src
         shutil.copytree(extract_path / "codegen", src_dir / "codegen")
@@ -294,6 +293,8 @@ class Handler(server.ProjectAPIHandler):
             ret.append(f"VERBOSE=1")
             ret.append(f"V=1")
         cfu_root = options.get("cfu_root", None)
+        if cfu_root is None:
+            assert "CFU_ROOT" in os.environ
         if cfu_root is not None:
             ret.append(f"CFU_ROOT={cfu_root}")
         proj_name = PROJECT_DIR.name
@@ -309,7 +310,9 @@ class Handler(server.ProjectAPIHandler):
         make_args += self.get_cfu_make_args(options)
         # print("make_args", make_args)
         if str2bool(options.get("quiet"), True):
-            check_call(["make", "software", *make_args], cwd=PROJECT_DIR, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            check_call(
+                ["make", "software", *make_args], cwd=PROJECT_DIR, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+            )
         else:
             check_call(["make", "software", *make_args], cwd=PROJECT_DIR)
 
@@ -322,7 +325,12 @@ class Handler(server.ProjectAPIHandler):
         make_args += self.get_cfu_make_args(options)
         # print("make_args", make_args)
         if str2bool(options.get("quiet"), True):
-            check_call(["make", "renode-scripts", *make_args], cwd=PROJECT_DIR, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            check_call(
+                ["make", "renode-scripts", *make_args],
+                cwd=PROJECT_DIR,
+                stderr=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+            )
         else:
             check_call(["make", "renode-scripts", *make_args], cwd=PROJECT_DIR)
 
@@ -353,7 +361,7 @@ class Handler(server.ProjectAPIHandler):
         renode_args = []
         renode_args.append(renode_exe)
         renode_args += ["-e", "s @digilent_arty.resc"]
-        renode_args += ["-e", f"emulation CreateUartPtyTerminal \"term\" \"{pty_path}\""]
+        renode_args += ["-e", f'emulation CreateUartPtyTerminal "term" "{pty_path}"']
         renode_args += ["-e", "connector Connect sysbus.uart term"]
         # renode_args += ["-e", "sysbus.uart WriteChar 0x33"]  # write 3 char for project menu
         # print("renode_args", renode_args)
@@ -459,7 +467,7 @@ class Handler(server.ProjectAPIHandler):
                 # print("empty read")
                 continue
 
-            if b == b'\xfe':
+            if b == b"\xfe":
                 # push back into buffer
                 # print("found start byte", b)
                 self._rx_buffer = b

@@ -16,6 +16,7 @@
 # This variable lists symbols to define to the C preprocessor
 export DEFINES :=
 export INCLUDES :=
+export GEN_RENODE_EXTRA_ARGS :=
 
 # Uncomment this line to use software defined CFU functions in software_cfu.cc
 #DEFINES += CFU_SOFTWARE_DEFINED
@@ -24,6 +25,8 @@ export INCLUDES :=
 
 # This says to NOT compile the TFLM library or any models
 export SKIP_TFLM=1
+export GEN_RENODE_EXTRA_ARGS += --gdbserver-port 0
+export GEN_RENODE_EXTRA_ARGS += --disable-analyzer
 
 # Uncomment this line to skip individual profiling output (has minor effect on performance).
 #DEFINES += NPROFILE
@@ -31,6 +34,7 @@ export SKIP_TFLM=1
 # Extra options
 INCLUDES += ${CURDIR}/src/runtime/include
 INCLUDES += ${CURDIR}/src/runtime/src/runtime/crt/microtvm_rpc_server
+INCLUDES += ${CURDIR}/src/support
 
 CFU_ROOT ?= ${CURDIR}/../..
 include $(CFU_ROOT)/proj/proj.mk

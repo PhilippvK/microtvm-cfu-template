@@ -134,6 +134,13 @@ class Handler(server.ProjectAPIHandler):
                     default=WORKSPACE_SIZE_BYTES,
                     help="Sets the value of TVM_WORKSPACE_SIZE_BYTES.",
                 ),
+                server.ProjectOption(
+                    "verilog_file",
+                    optional=["generate_project"],
+                    type="str",
+                    default=None,
+                    help="Path to custom cfu.v file.",
+                ),
                 # server.ProjectOption(
                 #     "arch",
                 #     optional=["build"],
@@ -226,8 +233,14 @@ class Handler(server.ProjectAPIHandler):
             options.get("debug", False),
         )
         # Copy project files
+        verilog_file = options.get(verilog_file)
+        if verilog_file is None
+            verilog_file = current_dir / "cfu.v",
+        else:
+            verilog_file = Path(verilog_file)
+        assert verilog_file.is_file(), f"Missing file: {verilog_file}"
         shutil.copy2(
-            current_dir / "cfu.v",
+            verilog_file,
             project_dir / "cfu.v",
         )
         proj_name = project_dir.name

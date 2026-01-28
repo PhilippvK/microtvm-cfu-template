@@ -32,7 +32,6 @@ import tempfile
 import time
 import termios
 import tty
-import distutils.util
 
 
 def configure_pty_raw(fd):
@@ -50,6 +49,9 @@ def configure_pty_raw(fd):
 import warnings
 
 warnings.simplefilter("ignore", ResourceWarning)
+warnings.simplefilter("ignore", DeprecationWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+import distutils.util
 
 from tvm.micro.project_api import server
 

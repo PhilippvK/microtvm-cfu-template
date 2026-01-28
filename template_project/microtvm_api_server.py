@@ -236,7 +236,7 @@ class Handler(server.ProjectAPIHandler):
         )
         # Copy project files
         verilog_file = options.get(verilog_file)
-        if verilog_file is None
+        if verilog_file is None:
             verilog_file = current_dir / "cfu.v",
         else:
             verilog_file = Path(verilog_file)

@@ -235,7 +235,7 @@ class Handler(server.ProjectAPIHandler):
             options.get("debug", False),
         )
         # Copy project files
-        verilog_file = options.get(verilog_file)
+        verilog_file = options.get("verilog_file")
         if verilog_file is None:
             verilog_file = current_dir / "cfu.v",
         else:

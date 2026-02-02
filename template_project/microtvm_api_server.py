@@ -143,6 +143,13 @@ class Handler(server.ProjectAPIHandler):
                     default=None,
                     help="Path to custom cfu.v file.",
                 ),
+                server.ProjectOption(
+                    "rtl_sim",
+                    optional=["build", "flash", "open_transport"],
+                    type="bool",
+                    default=False,
+                    help="Enable RTL Sim",
+                ),
                 # server.ProjectOption(
                 #     "arch",
                 #     optional=["build"],
@@ -315,6 +322,11 @@ class Handler(server.ProjectAPIHandler):
         proj_name = PROJECT_DIR.name
         ret.append(f"PROJ={proj_name}")
         ret.append(f"PROJ_DIR={PROJECT_DIR}")
+        ret.append(f"OUT_DIR={PROJECT_DIR}/soc_build")
+        ret.append(f"SOC_BUILD_DIR={PROJECT_DIR}/soc_build")
+        rtl_sim = str2bool(options.get("rtl_sim"), True)
+        if rtl_sim:
+            ret.append("PLATFORM=sim")
         return ret
 
     def build(self, options):
@@ -339,15 +351,32 @@ class Handler(server.ProjectAPIHandler):
         make_args = []
         make_args += self.get_cfu_make_args(options)
         # print("make_args", make_args)
-        if str2bool(options.get("quiet"), True):
-            check_call(
-                ["make", "renode-scripts", *make_args],
-                cwd=PROJECT_DIR,
-                stderr=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-            )
+        rtl_sim = str2bool(options.get("rtl_sim"), True)
+        if rtl_sim:
+            out_dir = PROJECT_DIR / "soc_build"
+            if str2bool(options.get("quiet"), True):
+                check_call(["make", "load2", *make_args], env=env, cwd=PROJECT_DIR, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            else:
+                check_call(["make", "load2", *make_args], env=env, cwd=PROJECT_DIR)
+            gateware_dir = out_dir / "gateware"
+            # print("gateware_dir", gateware_dir)
+            assert gateware_dir.is_dir()
+            if str2bool(options.get("quiet"), True):
+                check_call(["bash", "build_sim.sh"], env=env, cwd=gateware_dir, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            else:
+                check_call(["bash", "build_sim.sh"], env=env, cwd=gateware_dir)
+            vsim = gateware_dir / "obj_dir" / "Vsim"
+            assert vsim.is_file()
         else:
-            check_call(["make", "renode-scripts", *make_args], cwd=PROJECT_DIR)
+            if str2bool(options.get("quiet"), True):
+                check_call(
+                    ["make", "renode-scripts", *make_args],
+                    cwd=PROJECT_DIR,
+                    stderr=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                )
+            else:
+                check_call(["make", "renode-scripts", *make_args], cwd=PROJECT_DIR)
 
     def _set_nonblock(self, fd):
         flag = fcntl.fcntl(fd, fcntl.F_GETFL)
@@ -364,63 +393,86 @@ class Handler(server.ProjectAPIHandler):
         assert cfu_root is not None
         cfu_root = pathlib.Path(cfu_root)
         assert cfu_root.is_dir(), f"Missing: {cfu_root}"
-        renode_exe = cfu_root / "third_party" / "renode" / "renode"
-        assert renode_exe.is_file(), f"Missing: {renode_exe}"
-        build_dir = PROJECT_DIR / "build"
-        assert build_dir.is_dir(), f"Missing: {build_dir}"
-        sim_dir = build_dir / "renode"
-        assert sim_dir.is_dir(), f"Missing: {sim_dir}"
-        pty_path = PROJECT_DIR / "uart.pty"
-        if pty_path.exists():
-            os.unlink(pty_path)
-        renode_args = []
-        renode_args.append(renode_exe)
-        renode_args += ["-e", "s @digilent_arty.resc"]
-        renode_args += ["-e", f'emulation CreateUartPtyTerminal "term" "{pty_path}"']
-        renode_args += ["-e", "connector Connect sysbus.uart term"]
-        # renode_args += ["-e", "sysbus.uart WriteChar 0x33"]  # write 3 char for project menu
-        # print("renode_args", renode_args)
-        # print("sim_dir", sim_dir)
-        # input(">")
-        self._proc = subprocess.Popen(
-            renode_args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            # stderr=subprocess.PIPE,
-            bufsize=0,
-            preexec_fn=os.setsid,
-            cwd=sim_dir,
-        )
-        # print("A")
-        # Wait for PTY to appear
-        deadline = time.time() + 30.0
-        while not os.path.exists(pty_path):
-            if time.time() > deadline:
-                raise RuntimeError(f"PTY not created: {pty_path}")
-            time.sleep(0.05)
+        rtl_sim = str2bool(options.get("rtl_sim"), True)
+        if rtl_sim:
+            out_dir = PROJECT_DIR / "soc_build"
+            gateware_dir = out_dir / "gateware"
+            vsim = gateware_dir / "obj_dir" / "Vsim"
+            assert vsim.is_file()
+            self._proc = subprocess.Popen(
+                # [vsim],
+                vsim,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=0,
+                # preexec_fn=os.setsid,
+                cwd=gateware_dir,
+                # cwd=PROJECT_DIR
+            )
+            # print("A")
+            # Non-blocking
+            self._set_nonblock(self._proc.stdin.fileno())
+            self._set_nonblock(self._proc.stdout.fileno())
+            fd = self._proc.stdin.fileno()
+            # Put PTY into raw mode (CRITICAL)
+            # tty.setraw(fd)
+        else:
+            renode_exe = cfu_root / "third_party" / "renode" / "renode"
+            assert renode_exe.is_file(), f"Missing: {renode_exe}"
+            build_dir = PROJECT_DIR / "build"
+            assert build_dir.is_dir(), f"Missing: {build_dir}"
+            sim_dir = build_dir / "renode"
+            assert sim_dir.is_dir(), f"Missing: {sim_dir}"
+            pty_path = PROJECT_DIR / "uart.pty"
+            if pty_path.exists():
+                os.unlink(pty_path)
+            renode_args = []
+            renode_args.append(renode_exe)
+            renode_args += ["-e", "s @digilent_arty.resc"]
+            renode_args += ["-e", f'emulation CreateUartPtyTerminal "term" "{pty_path}"']
+            renode_args += ["-e", "connector Connect sysbus.uart term"]
+            # renode_args += ["-e", "sysbus.uart WriteChar 0x33"]  # write 3 char for project menu
+            # print("renode_args", renode_args)
+            # print("sim_dir", sim_dir)
+            # input(">")
+            self._proc = subprocess.Popen(
+                renode_args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                # stderr=subprocess.PIPE,
+                bufsize=0,
+                preexec_fn=os.setsid,
+                cwd=sim_dir,
+            )
+            # print("A")
+            # Wait for PTY to appear
+            deadline = time.time() + 30.0
+            while not os.path.exists(pty_path):
+                if time.time() > deadline:
+                    raise RuntimeError(f"PTY not created: {pty_path}")
+                time.sleep(0.05)
 
-        # Open PTY
-        self._pty_fd = os.open(pty_path, os.O_RDWR | os.O_NOCTTY)
+            # Open PTY
+            self._pty_fd = os.open(pty_path, os.O_RDWR | os.O_NOCTTY)
 
-        # Put PTY into raw mode (CRITICAL)
-        attrs = termios.tcgetattr(self._pty_fd)
-        tty.setraw(self._pty_fd)
-        termios.tcsetattr(self._pty_fd, termios.TCSANOW, attrs)
-        configure_pty_raw(self._pty_fd)
+            # Put PTY into raw mode (CRITICAL)
+            attrs = termios.tcgetattr(self._pty_fd)
+            tty.setraw(self._pty_fd)
+            termios.tcsetattr(self._pty_fd, termios.TCSANOW, attrs)
+            configure_pty_raw(self._pty_fd)
 
-        # Non-blocking
-        self._set_nonblock(self._pty_fd)
-        # input("press enter to cont")
-        # print("goooo")
-        self._await_ready([], [self._pty_fd])
-        os.write(self._pty_fd, b"3")
-        # self._await_ready([self._pty_fd], [])
-        # os.read(self._pty_fd, 24)
+            # Non-blocking
+            self._set_nonblock(self._pty_fd)
+            fd = self._pty_fd
+        self._await_ready([], [fd])
+        # print("ready")
+        os.write(fd, b"3")
+        # print("written")
+        # os.write(fd, b"3\n")
+        # print("written")
         self._drain_until_rpc_start()
-        # input(">>>>>>>")
-        # time.sleep(30.0)
-        # print("abc?")
 
         atexit.register(lambda: self.close_transport())
         return server.TransportTimeouts(
@@ -435,12 +487,14 @@ class Handler(server.ProjectAPIHandler):
     def close_transport(self):
         if PRINT:
             print("close_transport")
-        if self._pty_fd is not None:
-            try:
-                os.close(self._pty_fd)
-            except OSError:
-                pass
-            self._pty_fd = None
+        rtl_sim = self._pty_fd is None
+        if not rtl_sim:
+            if self._pty_fd is not None:
+                try:
+                    os.close(self._pty_fd)
+                except OSError:
+                    pass
+                self._pty_fd = None
         if self._proc is not None:
             proc = self._proc
             pgrp = os.getpgid(proc.pid)
@@ -449,9 +503,10 @@ class Handler(server.ProjectAPIHandler):
             proc.kill()
             proc.wait()
             # os.killpg(pgrp, signal.SIGKILL)
-        pty_path = PROJECT_DIR / "uart.pty"
-        if pty_path.exists():
-            os.unlink(pty_path)
+        if not rtl_sim:
+            pty_path = PROJECT_DIR / "uart.pty"
+            if pty_path.exists():
+                os.unlink(pty_path)
 
     def _await_ready(self, rlist, wlist, timeout_sec=None, end_time=None):
         # print("await_ready", rlist, wlist, timeout_sec, end_time)
@@ -466,17 +521,21 @@ class Handler(server.ProjectAPIHandler):
 
         return True
 
-    def _drain_until_rpc_start(self, timeout=10.0):
+    # def _drain_until_rpc_start(self, timeout=10.0):
+    def _drain_until_rpc_start(self, timeout=100.0):
         if PRINT:
             print("_drain_until_rpc_start")
         end = time.time() + timeout
         hist = b""
+        rtl_sim = self._pty_fd is None
+        fd = self._proc.stdout.fileno() if rtl_sim else self._pty_fd
+        fd2 = self._proc.stdin.fileno() if rtl_sim else self._pty_fd
         while time.time() < end:
-            r, _, _ = select.select([self._pty_fd], [], [], 0.05)
+            r, _, _ = select.select([fd], [], [], 0.05)
             if not r:
                 continue
 
-            b = os.read(self._pty_fd, 1)
+            b = os.read(fd, 1)
             hist += b
             if not b:
                 # print("empty read")
@@ -489,6 +548,12 @@ class Handler(server.ProjectAPIHandler):
                 # print("hist", hist)
                 return
             # print("received non-start byte", b)
+            if b"main>" in hist:
+                # print("found main>")
+                self._await_ready([], [fd2])
+                # print("ready")
+                os.write(fd2, b"3")
+                # print("written")
 
         # print("hist", hist)
         raise RuntimeError("RPC start byte not found")
@@ -505,14 +570,16 @@ class Handler(server.ProjectAPIHandler):
             return data
         if self._proc is None:
             raise server.TransportClosedError()
-        assert self._pty_fd is not None
 
         end_time = None if timeout_sec is None else time.monotonic() + timeout_sec
 
+        rtl_sim = self._pty_fd is None
+        fd = self._proc.stdout.fileno() if rtl_sim else self._pty_fd
+
         try:
-            self._await_ready([self._pty_fd], [], end_time=end_time)
+            self._await_ready([fd], [], end_time=end_time)
             # print("read?")
-            to_return = os.read(self._pty_fd, n)
+            to_return = os.read(fd, n)
             # print("ok!")
         except BrokenPipeError:
             to_return = 0
@@ -531,17 +598,27 @@ class Handler(server.ProjectAPIHandler):
         if self._proc is None:
             raise server.TransportClosedError()
 
-        assert self._pty_fd is not None
         end_time = None if timeout_sec is None else time.monotonic() + timeout_sec
 
+        rtl_sim = self._pty_fd is None
+        fd = self._proc.stdin.fileno() if rtl_sim else self._pty_fd
         data_len = len(data)
         while data:
             time.sleep(0.05)
-            self._await_ready([], [self._pty_fd], end_time=end_time)
-            try:
-                num_written = os.write(self._pty_fd, data)
-            except BrokenPipeError:
+            if False:
+                self._await_ready([], [fd], end_time=end_time)
+                try:
+                    num_written = os.write(fd, data)
+                except BrokenPipeError:
+                    num_written = 0
+            else:
                 num_written = 0
+                for b in data:
+                    self._await_ready([], [fd], end_time=end_time)
+                    num_written_ = os.write(fd, bytes([b]))  # send one byte
+                    num_written += num_written_
+                    # os.fsync(fd)               # ensure byte is flushed immediately
+                    time.sleep(0.1) 
 
             if not num_written:
                 self.disconnect_transport()

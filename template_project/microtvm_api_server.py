@@ -150,6 +150,13 @@ class Handler(server.ProjectAPIHandler):
                     default=False,
                     help="Enable RTL Sim",
                 ),
+                server.ProjectOption(
+                    "use_sw_dir",
+                    optional=["build", "flash", "open_transport"],
+                    type="str",
+                    default=None,
+                    help="TODO",
+                ),
                 # server.ProjectOption(
                 #     "arch",
                 #     optional=["build"],
@@ -327,6 +334,15 @@ class Handler(server.ProjectAPIHandler):
         rtl_sim = str2bool(options.get("rtl_sim"), True)
         if rtl_sim:
             ret.append("PLATFORM=sim")
+        use_sw_dir = options.get("use_sw_dir", None)
+        if use_sw_dir is not None:
+            assert pathlib.Path(use_sw_dir).is_dir(), f"Missing dir: {use_sw_dir}"
+            # litex_extra_args = f"--software-dir {use_sw_dir} --no-compile-software"
+            litex_extra_args = f"--software-dir {use_sw_dir}"
+            # TODO: variant!
+            ret.append(f"EXTRA_LITEX_ARGS={litex_extra_args}")
+            ret.append(f"SOC_SOFTWARE_DIR={use_sw_dir}")
+        # ret.append("-d")
         return ret
 
     def build(self, options):
@@ -348,6 +364,7 @@ class Handler(server.ProjectAPIHandler):
         if PRINT:
             print("flash")
         env = self.prepare_environment(os.environ.copy(), options)
+        env["LIBC_CLEANUP"] = "1"
         make_args = []
         make_args += self.get_cfu_make_args(options)
         # print("make_args", make_args)

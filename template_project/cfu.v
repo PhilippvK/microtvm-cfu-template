@@ -1,3 +1,5 @@
+`timescale 1ns/1ps
+
 module Cfu (
     input wire         cmd_valid,
     output wire        cmd_ready,

@@ -489,7 +489,8 @@ class Handler(server.ProjectAPIHandler):
         # print("written")
         # os.write(fd, b"3\n")
         # print("written")
-        self._drain_until_rpc_start()
+        drain_timeout = 100.0 if rtl_sim else 10.0
+        self._drain_until_rpc_start(timeout=drain_timeout)
 
         atexit.register(lambda: self.close_transport())
         return server.TransportTimeouts(
@@ -622,20 +623,22 @@ class Handler(server.ProjectAPIHandler):
         data_len = len(data)
         while data:
             time.sleep(0.05)
-            if False:
+            if not rtl_sim:
                 self._await_ready([], [fd], end_time=end_time)
                 try:
                     num_written = os.write(fd, data)
                 except BrokenPipeError:
                     num_written = 0
             else:
+                # Slow down writing to not excceed uart buffers on RTL
                 num_written = 0
                 for b in data:
                     self._await_ready([], [fd], end_time=end_time)
                     num_written_ = os.write(fd, bytes([b]))  # send one byte
                     num_written += num_written_
                     # os.fsync(fd)               # ensure byte is flushed immediately
-                    time.sleep(0.1) 
+                    delay = 0.1
+                    time.sleep(delay)
 
             if not num_written:
                 self.disconnect_transport()

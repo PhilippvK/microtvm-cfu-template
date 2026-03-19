@@ -197,6 +197,13 @@ class Handler(server.ProjectAPIHandler):
                     type="str",
                     help="Path to verilator installation.",
                 ),
+                server.ProjectOption(
+                    "support_dir",
+                    optional=["generate_project", "build"],
+                    default=None,
+                    type="str",
+                    help="Path to support directory",
+                ),
             ],
         )
 
@@ -296,8 +303,13 @@ class Handler(server.ProjectAPIHandler):
             else:
                 shutil.copy2(src_path, dst_path)
 
-        support_path = src_dir / "support"
-        shutil.copytree(current_dir / "support", support_path, dirs_exist_ok=True)
+        support_path = project_dir / "src" / "support"
+        os.mkdir(support_path)
+        default_support_dir = current_dir / "support"
+        support_dir = options.get("support_dir", default_support_dir)
+        assert support_dir is not None
+        assert pathlib.Path(support_dir).is_dir(), f"Missing: {support_dir}"
+        shutil.copytree(support_dir, support_path, dirs_exist_ok=True)
 
         # Copy codegen files to src
         shutil.copytree(extract_path / "codegen", src_dir / "codegen")

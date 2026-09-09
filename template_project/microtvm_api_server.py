@@ -260,7 +260,7 @@ class Handler(server.ProjectAPIHandler):
         if verilog_file is None:
             verilog_file = current_dir / "cfu.v"
         else:
-            verilog_file = Path(verilog_file)
+            verilog_file = pathlib.Path(verilog_file)
         assert verilog_file.is_file(), f"Missing file: {verilog_file}"
         shutil.copy2(
             verilog_file,

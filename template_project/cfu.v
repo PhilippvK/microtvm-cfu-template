@@ -162,7 +162,7 @@ module Cfu (
 
                     // Common accumulation for both
                     for (j = 0; j < 8; j = j+1) begin
-                        prod[j] = ws[j] * (acts[j] + 128);
+                        prod[j] = ws[j] * acts[j];
                     end
                     sum_0 <= sum_0 + prod[0];
                     sum_1 <= sum_1 + prod[1];
@@ -185,7 +185,7 @@ module Cfu (
                         ws[j+4]   = active_clusters[alu_mac_count*8+j+4];
                     end
                     for (j = 0; j < 8; j = j+1) begin
-                        prod[j] = ws[j] * (acts[j] + 128);
+                        prod[j] = ws[j] * acts[j];
                     end
                     sum_0 <= sum_0 + prod[0];
                     sum_1 <= sum_1 + prod[1];

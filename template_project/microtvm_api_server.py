@@ -19,19 +19,25 @@ import fcntl
 import multiprocessing
 import atexit
 import os
-import signal
-import shlex
 import os.path
+import shlex
 import pathlib
 import select
 import shutil
 import logging
 import subprocess
 import tarfile
-import tempfile
 import time
 import termios
 import tty
+
+# TODO: make optional
+try:
+    from litex.tools.litex_term import LiteXTerm
+
+    HAS_LITEX = True
+except ImportError:
+    HAS_LITEX = False
 
 
 def configure_pty_raw(fd):
@@ -80,6 +86,7 @@ CPU_FREQ = 100e6
 # ABI = "ilp32d"
 # TRIPLE = "riscv64-unknown-elf"
 NPROC = multiprocessing.cpu_count()
+NUM_JOBS = int(os.environ.get("MICROTVM_JOBS", NPROC))
 
 
 def str2bool(value, allow_none=False):
@@ -101,6 +108,7 @@ class Handler(server.ProjectAPIHandler):
         super(Handler, self).__init__()
         self._proc = None
         self._pty_fd = None
+        self._serial = None
 
     def server_info_query(self, tvm_version):
         return server.ServerInfo(
@@ -149,6 +157,48 @@ class Handler(server.ProjectAPIHandler):
                     type="bool",
                     default=False,
                     help="Enable RTL Sim",
+                ),
+                server.ProjectOption(
+                    "cpu_variant",
+                    optional=["build", "flash", "open_transport"],
+                    type="str",
+                    default=None,
+                    help="VexRiscv Variant to use",
+                ),
+                server.ProjectOption(
+                    "fpga_sim",
+                    optional=["build", "flash", "open_transport"],
+                    type="bool",
+                    default=False,
+                    help="Enable FPGA Sim",
+                ),
+                server.ProjectOption(
+                    "fpga_target",
+                    optional=["build", "flash", "open_transport"],
+                    type="str",
+                    default="digilent_arty",
+                    help="FPGA Target to use",
+                ),
+                server.ProjectOption(
+                    "fpga_variant",
+                    optional=["build", "flash", "open_transport"],
+                    type="str",
+                    default="a7-100",
+                    help="FPGA Variant to use",
+                ),
+                server.ProjectOption(
+                    "fpga_tty",
+                    optional=["build", "flash", "open_transport"],
+                    type="str",
+                    default=None,
+                    help="FPGA TTY to use",
+                ),
+                server.ProjectOption(
+                    "baud",
+                    optional=["build", "flash", "open_transport"],
+                    type="int",
+                    default=None,
+                    help="Buadrate",
                 ),
                 server.ProjectOption(
                     "use_sw_dir",
@@ -325,14 +375,16 @@ class Handler(server.ProjectAPIHandler):
         if verilator_install_dir is not None:
             new_path = f"{verilator_install_dir}/bin:{new_path}"
         env["PATH"] = new_path
+        env["JOBS"] = str(NUM_JOBS)
+        env["BUILD_JOBS"] = str(NUM_JOBS)
         return env
 
     def get_cfu_make_args(self, options):
         ret = []
         verbose = options.get("verbose", None)
         if verbose is not None:
-            ret.append(f"VERBOSE=1")
-            ret.append(f"V=1")
+            ret.append("VERBOSE=1")
+            ret.append("V=1")
         cfu_root = options.get("cfu_root", None)
         if cfu_root is None:
             assert "CFU_ROOT" in os.environ
@@ -344,16 +396,36 @@ class Handler(server.ProjectAPIHandler):
         ret.append(f"OUT_DIR={PROJECT_DIR}/soc_build")
         ret.append(f"SOC_BUILD_DIR={PROJECT_DIR}/soc_build")
         rtl_sim = str2bool(options.get("rtl_sim"), True)
+        fpga_sim = str2bool(options.get("fpga_sim"), True)
+        assert not (rtl_sim and fpga_sim), "FPGA and RTL sim can not be activated together"
         if rtl_sim:
             ret.append("PLATFORM=sim")
+        else:
+            ret.append("PLATFORM=common_soc")
         use_sw_dir = options.get("use_sw_dir", None)
+        litex_extra_args = ""
         if use_sw_dir is not None:
             assert pathlib.Path(use_sw_dir).is_dir(), f"Missing dir: {use_sw_dir}"
-            # litex_extra_args = f"--software-dir {use_sw_dir} --no-compile-software"
-            litex_extra_args = f"--software-dir {use_sw_dir}"
-            # TODO: variant!
-            ret.append(f"EXTRA_LITEX_ARGS={litex_extra_args}")
+            # litex_extra_args += f" --software-dir {use_sw_dir} --no-compile-software"
+            litex_extra_args += f" --software-dir {use_sw_dir}"
             ret.append(f"SOC_SOFTWARE_DIR={use_sw_dir}")
+        cpu_variant = options.get("cpu_variant", None)
+        if cpu_variant:
+            litex_extra_args += f" --cpu-variant {cpu_variant}"
+        if fpga_sim:
+            fpga_target = options.get("fpga_target", None)
+            assert fpga_target is not None
+            fpga_tty = options.get("fpga_tty", None)
+            assert fpga_tty is not None
+            ret.append(f"TARGET={fpga_target}")
+            ret.append(f"TTY={fpga_tty}")
+            baud = options.get("baud", 0)
+            if baud:
+                ret.append(f"UART_SPEED={baud}")
+            fpga_variant = options.get("fpga_variant", None)
+            if fpga_variant:
+                litex_extra_args += f" --variant {fpga_variant}"
+        ret.append(f"EXTRA_LITEX_ARGS={litex_extra_args}")
         # ret.append("-d")
         return ret
 
@@ -366,10 +438,14 @@ class Handler(server.ProjectAPIHandler):
         # print("make_args", make_args)
         if str2bool(options.get("quiet"), True):
             check_call(
-                ["make", "software", *make_args], cwd=PROJECT_DIR, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+                ["make", "software", *make_args],
+                cwd=PROJECT_DIR,
+                stderr=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                env=env,
             )
         else:
-            check_call(["make", "software", *make_args], cwd=PROJECT_DIR)
+            check_call(["make", "software", *make_args], cwd=PROJECT_DIR, env=env)
 
     def flash(self, options):
         # used for building the verilator model
@@ -381,21 +457,50 @@ class Handler(server.ProjectAPIHandler):
         make_args += self.get_cfu_make_args(options)
         # print("make_args", make_args)
         rtl_sim = str2bool(options.get("rtl_sim"), True)
+        fpga_sim = str2bool(options.get("fpga_sim"), True)
         if rtl_sim:
             out_dir = PROJECT_DIR / "soc_build"
             if str2bool(options.get("quiet"), True):
-                check_call(["make", "load2", *make_args], env=env, cwd=PROJECT_DIR, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                check_call(
+                    ["make", "load2", *make_args],
+                    env=env,
+                    cwd=PROJECT_DIR,
+                    stderr=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                )
             else:
                 check_call(["make", "load2", *make_args], env=env, cwd=PROJECT_DIR)
             gateware_dir = out_dir / "gateware"
             # print("gateware_dir", gateware_dir)
             assert gateware_dir.is_dir()
             if str2bool(options.get("quiet"), True):
-                check_call(["bash", "build_sim.sh"], env=env, cwd=gateware_dir, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                check_call(
+                    ["bash", "build_sim.sh"],
+                    env=env,
+                    cwd=gateware_dir,
+                    stderr=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                )
             else:
                 check_call(["bash", "build_sim.sh"], env=env, cwd=gateware_dir)
             vsim = gateware_dir / "obj_dir" / "Vsim"
             assert vsim.is_file()
+        elif fpga_sim:
+            if str2bool(options.get("quiet"), True):
+                check_call(
+                    ["make", "prog", *make_args],
+                    cwd=PROJECT_DIR,
+                    env=env,
+                    stderr=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                )
+            else:
+                check_call(
+                    ["make", "prog", *make_args],
+                    cwd=PROJECT_DIR,
+                    env=env,
+                )
+
         else:
             if str2bool(options.get("quiet"), True):
                 check_call(
@@ -423,6 +528,7 @@ class Handler(server.ProjectAPIHandler):
         cfu_root = pathlib.Path(cfu_root)
         assert cfu_root.is_dir(), f"Missing: {cfu_root}"
         rtl_sim = str2bool(options.get("rtl_sim"), True)
+        fpga_sim = str2bool(options.get("fpga_sim"), True)
         if rtl_sim:
             out_dir = PROJECT_DIR / "soc_build"
             gateware_dir = out_dir / "gateware"
@@ -446,6 +552,45 @@ class Handler(server.ProjectAPIHandler):
             fd = self._proc.stdin.fileno()
             # Put PTY into raw mode (CRITICAL)
             # tty.setraw(fd)
+        elif fpga_sim:
+            tty_path = options["fpga_tty"]
+            baud = int(options["baud"])
+
+            software_bin = PROJECT_DIR / "build" / "software.bin"
+            assert software_bin.is_file()
+            assert HAS_LITEX
+
+            term = LiteXTerm(
+                serial_boot=False,
+                kernel_image=str(software_bin),
+                kernel_address="0x40000000",
+                json_images=None,
+                safe=False,
+            )
+
+            term.open(tty_path, baud)
+            term.port.timeout = 0.1
+
+            self._litex_term = term
+            self._serial = term.port
+
+            # Wait for LiteX BIOS serial-loader request.
+            deadline = time.monotonic() + 30
+
+            while time.monotonic() < deadline:
+                b = term.port.read(1)
+                if not b:
+                    continue
+
+                # Optional robustness if BIOS presents an explicit serialboot prompt.
+                if term.detect_prompt(b):
+                    term.answer_prompt()
+
+                if term.detect_magic(b):
+                    term.answer_magic()  # uploads software.bin + jumps
+                    break
+            else:
+                raise RuntimeError("LiteX serial boot request not received")
         else:
             renode_exe = cfu_root / "third_party" / "renode" / "renode"
             assert renode_exe.is_file(), f"Missing: {renode_exe}"
@@ -517,14 +662,24 @@ class Handler(server.ProjectAPIHandler):
     def close_transport(self):
         if PRINT:
             print("close_transport")
-        rtl_sim = self._pty_fd is None
-        if not rtl_sim:
-            if self._pty_fd is not None:
-                try:
-                    os.close(self._pty_fd)
-                except OSError:
-                    pass
-                self._pty_fd = None
+        # fpga_sim = self._serial is not None
+        # rtl_sim = self._pty_fd is None and not fpga_sim
+        # if fpga_sim:
+        if self._serial is not None:
+            try:
+                self._serial.close()
+            finally:
+                self._serial = None
+                self._litex_term = None
+                self._rx_buffer = b""
+            return
+        # elif not rtl_sim:
+        if self._pty_fd is not None:
+            try:
+                os.close(self._pty_fd)
+            except OSError:
+                pass
+            self._pty_fd = None
         if self._proc is not None:
             proc = self._proc
             pgrp = os.getpgid(proc.pid)
@@ -533,10 +688,10 @@ class Handler(server.ProjectAPIHandler):
             proc.kill()
             proc.wait()
             # os.killpg(pgrp, signal.SIGKILL)
-        if not rtl_sim:
-            pty_path = PROJECT_DIR / "uart.pty"
-            if pty_path.exists():
-                os.unlink(pty_path)
+        # if not rtl_sim:
+        pty_path = PROJECT_DIR / "uart.pty"
+        if pty_path.exists():
+            os.unlink(pty_path)
 
     def _await_ready(self, rlist, wlist, timeout_sec=None, end_time=None):
         # print("await_ready", rlist, wlist, timeout_sec, end_time)

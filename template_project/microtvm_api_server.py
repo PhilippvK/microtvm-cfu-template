@@ -418,7 +418,7 @@ class Handler(server.ProjectAPIHandler):
             ret.append("PLATFORM=common_soc")
         use_sw_dir = options.get("use_sw_dir", None)
         use_gateware_dir = options.get("use_gateware_dir", None)
-        # bitstream_file = options.get("bitstream_file", None)
+        bitstream_file = options.get("bitstream_file", None)
         litex_extra_args = ""
         if use_sw_dir is not None:
             assert pathlib.Path(use_sw_dir).is_dir(), f"Missing dir: {use_sw_dir}"
@@ -430,8 +430,8 @@ class Handler(server.ProjectAPIHandler):
             litex_extra_args += f" --gateware-dir {use_gateware_dir}"
             ret.append(f"SOC_GATEWARE_DIR={use_gateware_dir}")
             ret.append(f"CSR_JSON={use_gateware_dir}/../csr.json")
-        # if bitstream_file is not None:
-        #     raise NotImplementedError
+        if bitstream_file is not None:
+            ret.append(f"BITSTREAM={bitstream_file}")
         cpu_variant = options.get("cpu_variant", None)
         if cpu_variant:
             litex_extra_args += f" --cpu-variant {cpu_variant}"
@@ -515,10 +515,10 @@ class Handler(server.ProjectAPIHandler):
         elif fpga_sim:
             bitstream_file = options.get("bitstream_file", None)
             if bitstream_file:
-                make_args += ["IGNORE_TIMING=1", "BITSTREAM={bitstream_file}"]
+                make_args += ["IGNORE_TIMING=1", f"BITSTREAM={bitstream_file}"]
             if str2bool(options.get("quiet"), True):
                 check_call(
-                    ["make", "prog", *make_args],
+                    ["make", "prog-only" if bitstream_file else "prog", *make_args],
                     cwd=PROJECT_DIR,
                     env=env,
                     stderr=subprocess.DEVNULL,

@@ -207,6 +207,20 @@ class Handler(server.ProjectAPIHandler):
                     default=None,
                     help="TODO",
                 ),
+                server.ProjectOption(
+                    "use_gateware_dir",
+                    optional=["build", "flash", "open_transport"],
+                    type="str",
+                    default=None,
+                    help="TODO",
+                ),
+                server.ProjectOption(
+                    "bitstream_file",
+                    optional=["build", "flash", "open_transport"],
+                    type="str",
+                    default=None,
+                    help="TODO",
+                ),
                 # server.ProjectOption(
                 #     "arch",
                 #     optional=["build"],
@@ -403,12 +417,21 @@ class Handler(server.ProjectAPIHandler):
         else:
             ret.append("PLATFORM=common_soc")
         use_sw_dir = options.get("use_sw_dir", None)
+        use_gateware_dir = options.get("use_gateware_dir", None)
+        # bitstream_file = options.get("bitstream_file", None)
         litex_extra_args = ""
         if use_sw_dir is not None:
             assert pathlib.Path(use_sw_dir).is_dir(), f"Missing dir: {use_sw_dir}"
             # litex_extra_args += f" --software-dir {use_sw_dir} --no-compile-software"
             litex_extra_args += f" --software-dir {use_sw_dir}"
             ret.append(f"SOC_SOFTWARE_DIR={use_sw_dir}")
+        if use_gateware_dir is not None:
+            assert pathlib.Path(use_gateware_dir).is_dir(), f"Missing dir: {use_gateware_dir}"
+            litex_extra_args += f" --gateware-dir {use_gateware_dir}"
+            ret.append(f"SOC_GATEWARE_DIR={use_gateware_dir}")
+            ret.append(f"CSR_JSON={use_gateware_dir}/../csr.json")
+        # if bitstream_file is not None:
+        #     raise NotImplementedError
         cpu_variant = options.get("cpu_variant", None)
         if cpu_variant:
             litex_extra_args += f" --cpu-variant {cpu_variant}"
@@ -470,22 +493,29 @@ class Handler(server.ProjectAPIHandler):
                 )
             else:
                 check_call(["make", "load2", *make_args], env=env, cwd=PROJECT_DIR)
-            gateware_dir = out_dir / "gateware"
-            # print("gateware_dir", gateware_dir)
-            assert gateware_dir.is_dir()
-            if str2bool(options.get("quiet"), True):
-                check_call(
-                    ["bash", "build_sim.sh"],
-                    env=env,
-                    cwd=gateware_dir,
-                    stderr=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                )
+            use_gateware_dir = options.get("use_gateware_dir", None)
+            if not use_gateware_dir:
+                gateware_dir = out_dir / "gateware"
+                # print("gateware_dir", gateware_dir)
+                assert gateware_dir.is_dir()
+                if str2bool(options.get("quiet"), True):
+                    check_call(
+                        ["bash", "build_sim.sh"],
+                        env=env,
+                        cwd=gateware_dir,
+                        stderr=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                    )
+                else:
+                    check_call(["bash", "build_sim.sh"], env=env, cwd=gateware_dir)
+                vsim = gateware_dir / "obj_dir" / "Vsim"
             else:
-                check_call(["bash", "build_sim.sh"], env=env, cwd=gateware_dir)
-            vsim = gateware_dir / "obj_dir" / "Vsim"
+                vsim = pathlib.Path(use_gateware_dir) / "obj_dir" / "Vsim"
             assert vsim.is_file()
         elif fpga_sim:
+            bitstream_file = options.get("bitstream_file", None)
+            if bitstream_file:
+                make_args += ["IGNORE_TIMING=1", "BITSTREAM={bitstream_file}"]
             if str2bool(options.get("quiet"), True):
                 check_call(
                     ["make", "prog", *make_args],
@@ -532,7 +562,12 @@ class Handler(server.ProjectAPIHandler):
         if rtl_sim:
             out_dir = PROJECT_DIR / "soc_build"
             gateware_dir = out_dir / "gateware"
-            vsim = gateware_dir / "obj_dir" / "Vsim"
+            use_gateware_dir = options.get("use_gateware_dir", None)
+            if not use_gateware_dir:
+                vsim = gateware_dir / "obj_dir" / "Vsim"
+            else:
+                vsim = pathlib.Path(use_gateware_dir) / "obj_dir" / "Vsim"
+            assert vsim.is_file()
             assert vsim.is_file()
             self._proc = subprocess.Popen(
                 # [vsim],
@@ -542,7 +577,7 @@ class Handler(server.ProjectAPIHandler):
                 stderr=subprocess.STDOUT,
                 bufsize=0,
                 # preexec_fn=os.setsid,
-                cwd=gateware_dir,
+                cwd=use_gateware_dir or gateware_dir,
                 # cwd=PROJECT_DIR
             )
             # print("A")

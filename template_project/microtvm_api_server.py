@@ -589,7 +589,7 @@ class Handler(server.ProjectAPIHandler):
             # tty.setraw(fd)
         elif fpga_sim:
             tty_path = options["fpga_tty"]
-            baud = int(options["baud"])
+            baud = int(options.get("baud") or 1843200)  # TODO: check default?
 
             software_bin = PROJECT_DIR / "build" / "software.bin"
             assert software_bin.is_file()
@@ -626,6 +626,7 @@ class Handler(server.ProjectAPIHandler):
                     break
             else:
                 raise RuntimeError("LiteX serial boot request not received")
+            fd = self._serial
         else:
             renode_exe = cfu_root / "third_party" / "renode" / "renode"
             assert renode_exe.is_file(), f"Missing: {renode_exe}"
@@ -675,10 +676,14 @@ class Handler(server.ProjectAPIHandler):
             # Non-blocking
             self._set_nonblock(self._pty_fd)
             fd = self._pty_fd
-        self._await_ready([], [fd])
-        # print("ready")
-        os.write(fd, b"3")
-        # print("written")
+        if self._serial is not None:
+            self._serial.write(b"3")
+            self._serial.flush()
+        else:
+            self._await_ready([], [fd])
+            # print("ready")
+            os.write(fd, b"3")
+            # print("written")
         # os.write(fd, b"3\n")
         # print("written")
         drain_timeout = 100.0 if rtl_sim else 10.0
@@ -747,35 +752,47 @@ class Handler(server.ProjectAPIHandler):
             print("_drain_until_rpc_start")
         end = time.time() + timeout
         hist = b""
-        rtl_sim = self._pty_fd is None
-        fd = self._proc.stdout.fileno() if rtl_sim else self._pty_fd
-        fd2 = self._proc.stdin.fileno() if rtl_sim else self._pty_fd
-        while time.time() < end:
-            r, _, _ = select.select([fd], [], [], 0.05)
-            if not r:
-                continue
+        is_serial = self._serial is not None
+        is_pty = self._pty_fd is not None
+        is_rtl = self._proc is not None and not is_pty and not is_serial
 
-            b = os.read(fd, 1)
+        while time.time() < end:
+            if is_serial:
+                b = self._serial.read(1)
+                if not b:
+                    continue
+
+            elif is_pty:
+                r, _, _ = select.select([self._pty_fd], [], [], 0.05)
+                if not r:
+                    continue
+                b = os.read(self._pty_fd, 1)
+
+            elif is_rtl:
+                fd = self._proc.stdout.fileno()
+                r, _, _ = select.select([fd], [], [], 0.05)
+                if not r:
+                    continue
+                b = os.read(fd, 1)
+
+            else:
+                raise RuntimeError("No active transport")
+
             hist += b
-            if not b:
-                # print("empty read")
-                continue
 
             if b == b"\xfe":
-                # push back into buffer
-                # print("found start byte", b)
                 self._rx_buffer = b
-                # print("hist", hist)
                 return
-            # print("received non-start byte", b)
-            if b"main>" in hist:
-                # print("found main>")
-                self._await_ready([], [fd2])
-                # print("ready")
-                os.write(fd2, b"3")
-                # print("written")
 
-        # print("hist", hist)
+            if b"main>" in hist:
+                if is_serial:
+                    self._serial.write(b"3")
+                    self._serial.flush()
+                elif is_pty:
+                    os.write(self._pty_fd, b"3")
+                else:
+                    os.write(self._proc.stdin.fileno(), b"3")
+
         raise RuntimeError("RPC start byte not found")
 
     def read_transport(self, n, timeout_sec):
@@ -788,37 +805,63 @@ class Handler(server.ProjectAPIHandler):
             if PRINT:
                 print("ret", data)
             return data
-        if self._proc is None:
+        if self._serial is not None:
+            old_timeout = self._serial.timeout
+            try:
+                self._serial.timeout = timeout_sec
+                data = self._serial.read(n)
+            finally:
+                self._serial.timeout = old_timeout
+
+            if not data:
+                raise server.IoTimeoutError()
+
+            return data
+
+        if self._proc is None and self._pty_fd is None:
             raise server.TransportClosedError()
 
         end_time = None if timeout_sec is None else time.monotonic() + timeout_sec
 
-        rtl_sim = self._pty_fd is None
-        fd = self._proc.stdout.fileno() if rtl_sim else self._pty_fd
+        if self._pty_fd is not None:
+            fd = self._pty_fd
+        else:
+            fd = self._proc.stdout.fileno()
 
         try:
             self._await_ready([fd], [], end_time=end_time)
-            # print("read?")
-            to_return = os.read(fd, n)
-            # print("ok!")
+            data = os.read(fd, n)
         except BrokenPipeError:
-            to_return = 0
+            data = b""
 
-        if not to_return:
+        if not data:
             self.close_transport()
             raise server.TransportClosedError()
-        if PRINT:
-            print("ret", to_return)
 
-        return to_return
+        return data
 
     def write_transport(self, data, timeout_sec):
         if PRINT:
             print("write_transport", data)
-        if self._proc is None:
-            raise server.TransportClosedError()
 
         end_time = None if timeout_sec is None else time.monotonic() + timeout_sec
+
+        if self._serial is not None:
+            old_timeout = self._serial.write_timeout
+            try:
+                self._serial.write_timeout = timeout_sec
+                num_written = self._serial.write(data)
+                self._serial.flush()
+            finally:
+                self._serial.write_timeout = old_timeout
+
+            if num_written != len(data):
+                raise server.IoTimeoutError()
+
+            return
+
+        if self._proc is None and self._pty_fd is None:
+            raise server.TransportClosedError()
 
         rtl_sim = self._pty_fd is None
         fd = self._proc.stdin.fileno() if rtl_sim else self._pty_fd

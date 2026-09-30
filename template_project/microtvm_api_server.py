@@ -16,6 +16,7 @@
 # under the License.
 
 import fcntl
+import hashlib
 import multiprocessing
 import atexit
 import os
@@ -62,10 +63,32 @@ import distutils.util
 from tvm.micro.project_api import server
 
 _LOG = logging.getLogger(__name__)
-_LOG.setLevel(logging.WARNING)
 
-PRINT = False
-# PRINT = True
+
+def str2bool(value, allow_none=False):
+    if value is None:
+        assert allow_none, "str2bool received None value while allow_none=False"
+        return value
+    return bool(value) if isinstance(value, (int, bool)) else bool(distutils.util.strtobool(value))
+
+
+# Keep this switch consistent with the ESP-IDF project API server.
+PRINT = str2bool(os.environ.get("MICROTVM_API_PRINT", False))
+_LOG.setLevel(logging.INFO if PRINT else logging.WARNING)
+
+# Serialize access to a physical FPGA UART when multiple Project API servers
+# share it. This follows the ESP-IDF server's LOCK environment-variable
+# convention; set LOCK=0 to disable locking.
+LOCK = str2bool(os.environ.get("LOCK", True))
+
+if LOCK:
+    from filelock import FileLock
+
+
+def debug_print(*args, **kwargs):
+    if PRINT:
+        print(*args, **kwargs)
+
 
 PROJECT_DIR = pathlib.Path(os.path.dirname(__file__) or os.getcwd())
 
@@ -89,16 +112,9 @@ NPROC = multiprocessing.cpu_count()
 NUM_JOBS = int(os.environ.get("MICROTVM_JOBS", NPROC))
 
 
-def str2bool(value, allow_none=False):
-    if value is None:
-        assert allow_none, "str2bool received None value while allow_none=False"
-        return value
-    return bool(value) if isinstance(value, (int, bool)) else bool(distutils.util.strtobool(value))
-
-
 def check_call(cmd_args, *args, **kwargs):
     cwd_str = "" if "cwd" not in kwargs else f" (in cwd: {kwargs['cwd']})"
-    _LOG.info("run%s: %s", cwd_str, " ".join(shlex.quote(a) for a in cmd_args))
+    _LOG.info("run%s: %s", cwd_str, " ".join(shlex.quote(str(a)) for a in cmd_args))
     return subprocess.check_call(cmd_args, *args, **kwargs)
 
 
@@ -109,6 +125,28 @@ class Handler(server.ProjectAPIHandler):
         self._proc = None
         self._pty_fd = None
         self._serial = None
+        self._device_lock = None
+
+    def _acquire_fpga_tty_lock(self, tty_path):
+        """Acquire an inter-process lock specific to the physical FPGA UART."""
+        if not LOCK:
+            return
+        if self._device_lock is not None:
+            return
+
+        resolved_tty = str(pathlib.Path(tty_path).resolve())
+        lock_id = hashlib.sha256(resolved_tty.encode("utf-8")).hexdigest()[:16]
+        lock_path = f"/tmp/microtvm_cfu_{lock_id}.lock"
+        debug_print("acquiring FPGA TTY lock", lock_path)
+        self._device_lock = FileLock(lock_path)
+        self._device_lock.acquire()
+        debug_print("acquired FPGA TTY lock", lock_path)
+
+    def _release_device_lock(self):
+        if self._device_lock is not None:
+            debug_print("releasing FPGA TTY lock")
+            self._device_lock.release()
+            self._device_lock = None
 
     def server_info_query(self, tvm_version):
         return server.ServerInfo(
@@ -221,6 +259,13 @@ class Handler(server.ProjectAPIHandler):
                     default=None,
                     help="TODO",
                 ),
+                server.ProjectOption(
+                    "skip_prog",
+                    optional=["build", "flash"],
+                    type="bool",
+                    default=False,
+                    help="Ignore bitsream programming",
+                ),
                 # server.ProjectOption(
                 #     "arch",
                 #     optional=["build"],
@@ -314,7 +359,7 @@ class Handler(server.ProjectAPIHandler):
 
         # Populate Makefile
         self._populate_makefile(
-            current_dir / f"Makefile.template",
+            current_dir / "Makefile.template",
             project_dir / "Makefile",
             options.get("workspace_size_bytes", WORKSPACE_SIZE_BYTES),
             options.get("debug", False),
@@ -453,8 +498,7 @@ class Handler(server.ProjectAPIHandler):
         return ret
 
     def build(self, options):
-        if PRINT:
-            print("build")
+        debug_print("build")
         env = self.prepare_environment(os.environ.copy(), options)
         make_args = []
         make_args += self.get_cfu_make_args(options)
@@ -472,8 +516,7 @@ class Handler(server.ProjectAPIHandler):
 
     def flash(self, options):
         # used for building the verilator model
-        if PRINT:
-            print("flash")
+        debug_print("flash")
         env = self.prepare_environment(os.environ.copy(), options)
         env["LIBC_CLEANUP"] = "1"
         make_args = []
@@ -481,6 +524,7 @@ class Handler(server.ProjectAPIHandler):
         # print("make_args", make_args)
         rtl_sim = str2bool(options.get("rtl_sim"), True)
         fpga_sim = str2bool(options.get("fpga_sim"), True)
+        skip_prog = str2bool(options.get("skip_prog"), False)
         if rtl_sim:
             out_dir = PROJECT_DIR / "soc_build"
             if str2bool(options.get("quiet"), True):
@@ -514,22 +558,29 @@ class Handler(server.ProjectAPIHandler):
             assert vsim.is_file()
         elif fpga_sim:
             bitstream_file = options.get("bitstream_file", None)
-            if bitstream_file:
-                make_args += ["IGNORE_TIMING=1", f"BITSTREAM={bitstream_file}"]
-            if str2bool(options.get("quiet"), True):
-                check_call(
-                    ["make", "prog-only" if bitstream_file else "prog", *make_args],
-                    cwd=PROJECT_DIR,
-                    env=env,
-                    stderr=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                )
-            else:
-                check_call(
-                    ["make", "prog", *make_args],
-                    cwd=PROJECT_DIR,
-                    env=env,
-                )
+            tty_path = options["fpga_tty"]
+            if not skip_prog:
+                self._acquire_fpga_tty_lock(tty_path)
+                try:
+                    if bitstream_file:
+                        make_args += ["IGNORE_TIMING=1", f"BITSTREAM={bitstream_file}"]
+                    if str2bool(options.get("quiet"), True):
+                        check_call(
+                            ["make", "prog-only" if bitstream_file else "prog", *make_args],
+                            cwd=PROJECT_DIR,
+                            env=env,
+                            stderr=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                        )
+                    else:
+                        check_call(
+                            ["make", "prog-only" if bitstream_file else "prog", *make_args],
+                            cwd=PROJECT_DIR,
+                            env=env,
+                        )
+                except:
+                    self._release_device_lock()
+                    raise
 
         else:
             if str2bool(options.get("quiet"), True):
@@ -549,8 +600,7 @@ class Handler(server.ProjectAPIHandler):
         assert (new_flag & os.O_NONBLOCK) != 0, "Cannot set file descriptor {fd} to non-blocking"
 
     def open_transport(self, options):
-        if PRINT:
-            print("open_transport")
+        debug_print("open_transport")
         cfu_root = options.get("cfu_root", None)
         if cfu_root is None:
             cfu_root = os.environ.get("CFU_ROOT")
@@ -595,6 +645,8 @@ class Handler(server.ProjectAPIHandler):
             assert software_bin.is_file()
             assert HAS_LITEX
 
+            self._acquire_fpga_tty_lock(tty_path)
+
             term = LiteXTerm(
                 serial_boot=False,
                 kernel_image=str(software_bin),
@@ -603,29 +655,37 @@ class Handler(server.ProjectAPIHandler):
                 safe=False,
             )
 
-            term.open(tty_path, baud)
-            term.port.timeout = 0.1
+            try:
+                term.open(tty_path, baud)
+                term.port.timeout = 0.1
 
-            self._litex_term = term
-            self._serial = term.port
+                self._litex_term = term
+                self._serial = term.port
 
-            # Wait for LiteX BIOS serial-loader request.
-            deadline = time.monotonic() + 30
+                # Wait for LiteX BIOS serial-loader request.
+                deadline = time.monotonic() + 30
 
-            while time.monotonic() < deadline:
-                b = term.port.read(1)
-                if not b:
-                    continue
+                while time.monotonic() < deadline:
+                    b = term.port.read(1)
+                    if not b:
+                        continue
 
-                # Optional robustness if BIOS presents an explicit serialboot prompt.
-                if term.detect_prompt(b):
-                    term.answer_prompt()
+                    # Optional robustness if BIOS presents an explicit serialboot prompt.
+                    if term.detect_prompt(b):
+                        term.answer_prompt()
 
-                if term.detect_magic(b):
-                    term.answer_magic()  # uploads software.bin + jumps
-                    break
-            else:
-                raise RuntimeError("LiteX serial boot request not received")
+                    if term.detect_magic(b):
+                        term.answer_magic()  # uploads software.bin + jumps
+                        break
+                else:
+                    raise RuntimeError("LiteX serial boot request not received")
+            except:
+                if self._serial is not None:
+                    self._serial.close()
+                    self._serial = None
+                    self._litex_term = None
+                self._release_device_lock()
+                raise
             fd = self._serial
         else:
             renode_exe = cfu_root / "third_party" / "renode" / "renode"
@@ -676,18 +736,22 @@ class Handler(server.ProjectAPIHandler):
             # Non-blocking
             self._set_nonblock(self._pty_fd)
             fd = self._pty_fd
-        if self._serial is not None:
-            self._serial.write(b"3")
-            self._serial.flush()
-        else:
-            self._await_ready([], [fd])
-            # print("ready")
-            os.write(fd, b"3")
+        try:
+            if self._serial is not None:
+                self._serial.write(b"3")
+                self._serial.flush()
+            else:
+                self._await_ready([], [fd])
+                # print("ready")
+                os.write(fd, b"3")
+                # print("written")
+            # os.write(fd, b"3\n")
             # print("written")
-        # os.write(fd, b"3\n")
-        # print("written")
-        drain_timeout = 100.0 if rtl_sim else 10.0
-        self._drain_until_rpc_start(timeout=drain_timeout)
+            drain_timeout = 100.0 if rtl_sim else 10.0
+            self._drain_until_rpc_start(timeout=drain_timeout)
+        except:
+            self.close_transport()
+            raise
 
         atexit.register(lambda: self.close_transport())
         return server.TransportTimeouts(
@@ -700,8 +764,7 @@ class Handler(server.ProjectAPIHandler):
         )
 
     def close_transport(self):
-        if PRINT:
-            print("close_transport")
+        debug_print("close_transport")
         # fpga_sim = self._serial is not None
         # rtl_sim = self._pty_fd is None and not fpga_sim
         # if fpga_sim:
@@ -712,7 +775,7 @@ class Handler(server.ProjectAPIHandler):
                 self._serial = None
                 self._litex_term = None
                 self._rx_buffer = b""
-            return
+                self._release_device_lock()
         # elif not rtl_sim:
         if self._pty_fd is not None:
             try:
@@ -732,6 +795,7 @@ class Handler(server.ProjectAPIHandler):
         pty_path = PROJECT_DIR / "uart.pty"
         if pty_path.exists():
             os.unlink(pty_path)
+        self._release_device_lock()
 
     def _await_ready(self, rlist, wlist, timeout_sec=None, end_time=None):
         # print("await_ready", rlist, wlist, timeout_sec, end_time)
@@ -748,8 +812,7 @@ class Handler(server.ProjectAPIHandler):
 
     # def _drain_until_rpc_start(self, timeout=10.0):
     def _drain_until_rpc_start(self, timeout=100.0):
-        if PRINT:
-            print("_drain_until_rpc_start")
+        debug_print("_drain_until_rpc_start")
         end = time.time() + timeout
         hist = b""
         is_serial = self._serial is not None
@@ -796,14 +859,12 @@ class Handler(server.ProjectAPIHandler):
         raise RuntimeError("RPC start byte not found")
 
     def read_transport(self, n, timeout_sec):
-        if PRINT:
-            print("read_transport", n)
+        debug_print("read_transport", n)
         if self._rx_buffer:
             # print("fill start byte")
             data = self._rx_buffer
             self._rx_buffer = b""
-            if PRINT:
-                print("ret", data)
+            debug_print("ret", data)
             return data
         if self._serial is not None:
             old_timeout = self._serial.timeout
@@ -841,8 +902,7 @@ class Handler(server.ProjectAPIHandler):
         return data
 
     def write_transport(self, data, timeout_sec):
-        if PRINT:
-            print("write_transport", data)
+        debug_print("write_transport", data)
 
         end_time = None if timeout_sec is None else time.monotonic() + timeout_sec
 
